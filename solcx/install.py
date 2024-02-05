@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import warnings
 import zipfile
 from base64 import b64encode
@@ -226,7 +227,18 @@ def set_solc_version(
         LOGGER.info(f"Using solc version {version}")
 
 
-def _select_pragma_version(pragma_string: str, version_list: List[Version]) -> Optional[Version]:
+def select_pragma_version(pragma_string: str, version_list: List[Version]) -> Optional[Version]:
+    """
+    Get a matching version from the given pragma string and a version list.
+
+    Args:
+        pragma_string (str): A pragma str.
+        version_list (List[Version]): A list of valid versions.
+
+    Returns:
+        Optional[Version]: A selected version from the given list.
+    """
+
     comparator_set_range = pragma_string.replace(" ", "").split("||")
     comparator_regex = re.compile(r"(([<>]?=?|\^)\d+\.\d+\.\d+)")
     version = None
@@ -275,7 +287,7 @@ def set_solc_version_pragma(
       Version: The new active `solc` version.
     """
     installed_versions = get_installed_solc_versions()
-    if not (version := _select_pragma_version(pragma_string, installed_versions)):
+    if not (version := select_pragma_version(pragma_string, installed_versions)):
         raise SolcNotInstalled(
             f"No compatible solc version installed."
             f" Use solcx.install_solc_version_pragma('{pragma_string}') to install."
@@ -315,7 +327,7 @@ def install_solc_pragma(
     """
 
     installed_versions = get_installable_solc_versions()
-    if version := _select_pragma_version(pragma_string, installed_versions):
+    if version := select_pragma_version(pragma_string, installed_versions):
         install_solc(version, show_progress=show_progress, solcx_binary_path=solcx_binary_path)
     else:
         raise UnsupportedVersionError(
@@ -342,12 +354,17 @@ def get_installable_solc_versions() -> List[Version]:
     return version_list
 
 
-def get_compilable_solc_versions(headers: Optional[Dict] = None) -> List[Version]:
+def get_compilable_solc_versions(
+    headers: Optional[Dict] = None, rate_limit_wait_time: float = 3.0
+) -> List[Version]:
     """
     Return a list of all ``solc`` versions that can be compiled from source by py-solc-x.
 
     Args:
       headers (Optional[Dict]): Headers to include in the request to Github.
+      rate_limit_wait_time (float): A value to use when waiting for rate-limiting.
+        Defaults to 3.0 but will increment to the value plus it's half for the
+        subsequent call.
 
     Returns:
       List: List of Versions objects of installable `solc` versions.
@@ -374,6 +391,14 @@ def get_compilable_solc_versions(headers: Optional[Dict] = None) -> List[Version
                 " it as the environment variable `GITHUB_TOKEN`:\n"
                 "https://github.blog/2013-05-16-personal-api-tokens/"
             )
+            LOGGER.warning(msg)
+
+            # Wait and retry
+            time.sleep(rate_limit_wait_time)
+            return get_compilable_solc_versions(
+                headers, rate_limit_wait_time=rate_limit_wait_time + (rate_limit_wait_time / 2)
+            )
+
         raise ConnectionError(msg)
 
     for release in data.json():
@@ -464,8 +489,9 @@ def install_solc(
                 version, filename, show_progress, solcx_binary_path=solcx_binary_path
             )
 
+        base_version = version if isinstance(version, str) else version.base_version
         try:
-            _validate_installation(version, solcx_binary_path=solcx_binary_path)
+            _validate_installation(Version(base_version), solcx_binary_path=solcx_binary_path)
         except SolcInstallationError as exc:
             if os_name != "windows":
                 exc.args = (
@@ -532,24 +558,25 @@ def compile_solc(
         with tarfile.open(fileobj=BytesIO(content)) as tar:
             tar.extractall(temp_path)
 
-        temp_path = temp_path.joinpath(f"solidity_{solc_version.base_version}")
+        temp_path = temp_path / f"solidity_{solc_version.base_version}"
 
-        try:
-            LOGGER.info("Running dependency installation script `install_deps.sh`...")
-            subprocess.check_call(
-                ["sh", temp_path.joinpath("scripts/install_deps.sh")], stderr=subprocess.DEVNULL
-            )
-        except subprocess.CalledProcessError as exc:
-            LOGGER.warning(exc, exc_info=True)
+        LOGGER.info("Running dependency installation script `install_deps.sh`...")
+        install_script = temp_path / "scripts" / "install_deps.sh"
+        if install_script.is_file():
+            try:
+                subprocess.check_call(["sh", install_script], stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as exc:
+                LOGGER.warning(exc, exc_info=True)
 
         original_path = os.getcwd()
-        temp_path.joinpath("build").mkdir(exist_ok=True)
-        os.chdir(str(temp_path.joinpath("build").resolve()))
+        build_path = temp_path / "build"
+        build_path.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(build_path.resolve()))
+
         try:
             for cmd in (["cmake", ".."], ["make"]):
                 LOGGER.info(f"Running `{cmd[0]}`...")
                 subprocess.check_call(cmd, stderr=subprocess.DEVNULL)
-            temp_path.joinpath("build/solc/solc").rename(install_path)
 
         except subprocess.CalledProcessError as exc:
             err_msg = (
@@ -567,6 +594,8 @@ def compile_solc(
         finally:
             os.chdir(original_path)
 
+        solc_path = build_path / "solc" / "solc"
+        solc_path.rename(install_path)
         install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
         _validate_installation(solc_version, solcx_binary_path)
 
@@ -588,7 +617,7 @@ def _get_temp_folder() -> Path:
     return path
 
 
-def _download_solc(url: str, show_progress: bool) -> bytes:
+def _download_solc(url: str, show_progress: bool, rate_limit_wait_time: float = 3.0) -> bytes:
     LOGGER.info(f"Downloading from {url}")
     response = requests.get(url, stream=show_progress)
     if response.status_code == 404:
@@ -596,7 +625,14 @@ def _download_solc(url: str, show_progress: bool) -> bytes:
             "404 error when attempting to download from {} - are you sure this"
             " version of solidity is available?".format(url)
         )
-    if response.status_code != 200:
+
+    elif response.status_code == 403 and "API rate limit exceeded" in response.text:
+        # Handle GitHub API rate limiting.
+        time_to_wait = rate_limit_wait_time or 1  # Prevent accidents
+        time.sleep(time_to_wait)
+        return _download_solc(url, show_progress, rate_limit_wait_time + (rate_limit_wait_time / 2))
+
+    elif response.status_code != 200:
         raise DownloadError(
             f"Received status code {response.status_code} when attempting to download from {url}"
         )
@@ -664,15 +700,26 @@ def _validate_installation(version: Version, solcx_binary_path: Union[Path, str,
         raise SolcInstallationError(
             "Downloaded binary would not execute, or returned unexpected output."
         )
-    if Version(installed_version.replace("-nightly", "")).base_version != version.base_version:
+
+    installed_version_clean = Version(
+        Version(installed_version.replace("-nightly", "")).base_version
+    )
+    base_version = version if isinstance(version, str) else version.base_version
+    if installed_version_clean.base_version != base_version:
         # Without the nightly suffix, it should be the same!
         _unlink_solc(binary_path)
         raise UnexpectedVersionError(
             f"Attempted to install solc v{version}, but got solc v{installed_version}"
         )
-    if installed_version != version.base_version:
+    if installed_version_clean not in (
+        Version(base_version),
+        f"{base_version}",
+    ) or installed_version.endswith("-nightly"):
         # If it does have the nightly suffix, then only warn.
-        warnings.warn(f"Installed solc version is v{installed_version}", UnexpectedVersionWarning)
+        warnings.warn(
+            f"Installed solc version is v{installed_version_clean}, expecting v{base_version}",
+            UnexpectedVersionWarning,
+        )
 
     if not get_default_solc_binary():
         set_solc_version(version)
